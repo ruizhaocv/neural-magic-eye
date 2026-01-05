@@ -109,6 +109,7 @@ def define_G(args):
         T = DisparityConv(max_shift=int(args.in_size / 4), output_nc=int(args.in_size / 4))
         G_input_nc = int(args.in_size / 4)
     else:
+        
         T = nn.Identity()
         G_input_nc = 3
 
@@ -128,6 +129,12 @@ def define_G(args):
         G = UnetGenerator(input_nc=G_input_nc, output_nc=1, num_downs=7, ngf=64, norm_layer=norm_layer)
     elif args.net_G == 'unet_256':
         G = UnetGenerator(input_nc=G_input_nc, output_nc=1, num_downs=8, ngf=32, norm_layer=norm_layer)
+        
+    elif args.net_G == 'vit_b_16_fcn':
+        G = ViTFCN(input_nc=G_input_nc, output_nc=1, vit_name='vit_b_16', img_size=args.in_size)
+    elif args.net_G == 'vit_l_16_fcn':
+        G = ViTFCN(input_nc=G_input_nc, output_nc=1, vit_name='vit_l_16', img_size=args.in_size)
+
     else:
         raise NotImplementedError('Generator model name [%s] is not recognized' % args.net_G)\
 
@@ -299,6 +306,87 @@ class ResNetFCN(torch.nn.Module):
         if self.output_sigmoid:
             x = self.sigmoid(x)
 
+        return x
+
+
+class ViTFCN(nn.Module):
+    """
+    ViT encoder + simple upsampling decoder to predict dense depth map.
+    Uses torchvision.models.vit_b_16 / vit_l_16.
+    """
+    def __init__(self, input_nc, output_nc=1, vit_name='vit_b_16', img_size=256,
+                 output_sigmoid=False):
+        super().__init__()
+
+        assert img_size % 16 == 0, "vit_b_16 uses patch_size=16, so img_size must be multiple of 16"
+
+        if vit_name == 'vit_b_16':
+            self.vit = models.vit_b_16(weights=None)
+            embed_dim = 768
+            patch = 16
+        elif vit_name == 'vit_l_16':
+            self.vit = models.vit_l_16(weights=None)
+            embed_dim = 1024
+            patch = 16
+        else:
+            raise NotImplementedError(vit_name)
+
+        self.img_size = img_size
+        self.patch = patch
+        self.grid = img_size // patch  # e.g. 256/16 = 16
+
+        # vit.conv_proj 默认 input_nc=3，如果你的输入通道不是3（例如你开了 disparity_conv），要替换掉
+        if input_nc != 3:
+            self.vit.conv_proj = nn.Conv2d(input_nc, embed_dim, kernel_size=patch, stride=patch, bias=True)
+
+        # 去掉分类头
+        self.vit.heads = nn.Identity()
+
+        # --------- 简单 decoder：从 16x16 上采样回 256x256 ----------
+        self.relu = nn.ReLU(inplace=True)
+        self.up2 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
+
+        # 16->32->64->128->256（x2 四次）
+        self.conv1 = nn.Conv2d(embed_dim, 256, 3, padding=1)
+        self.conv2 = nn.Conv2d(256, 128, 3, padding=1)
+        self.conv3 = nn.Conv2d(128, 64, 3, padding=1)
+        self.conv4 = nn.Conv2d(64, 64, 3, padding=1)
+        self.conv_out = nn.Conv2d(64, output_nc, 3, padding=1)
+
+        self.output_sigmoid = output_sigmoid
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        # x: [B, C, H, W] where H=W=img_size
+        B, C, H, W = x.shape
+        assert H == self.img_size and W == self.img_size, "Input size must match img_size for this simple implementation"
+
+        # torchvision ViT 的 forward_features 不是公开 API，但它内部流程基本是：
+        # conv_proj -> flatten -> add cls -> encoder -> take tokens
+        # 为了稳一点，我们用 vit._process_input（torchvision 里有）+ encoder
+        x = self.vit._process_input(x)                  # [B, num_patches, embed_dim]
+        cls = self.vit.class_token.expand(B, -1, -1)    # [B, 1, embed_dim]
+        x = torch.cat([cls, x], dim=1)                  # [B, 1+N, D]
+
+        x = x + self.vit.encoder.pos_embedding
+        x = self.vit.encoder.dropout(x)
+        x = self.vit.encoder.layers(x)
+        x = self.vit.encoder.ln(x)                      # [B, 1+N, D]
+
+        # 去 cls token，剩 patch tokens
+        x = x[:, 1:, :]                                 # [B, N, D], N=grid*grid
+        x = x.transpose(1, 2).contiguous()               # [B, D, N]
+        x = x.view(B, -1, self.grid, self.grid)          # [B, D, grid, grid] e.g. [B,768,16,16]
+
+        # decoder upsample to full-res
+        x = self.up2(self.relu(self.conv1(x)))           # 16->32
+        x = self.up2(self.relu(self.conv2(x)))           # 32->64
+        x = self.up2(self.relu(self.conv3(x)))           # 64->128
+        x = self.up2(self.relu(self.conv4(x)))           # 128->256
+        x = self.conv_out(x)                             # [B,1,256,256]
+
+        if self.output_sigmoid:
+            x = self.sigmoid(x)
         return x
 
 
